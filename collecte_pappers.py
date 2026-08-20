@@ -25,7 +25,7 @@ import requests
 
 # Colle ta clé Pappers ici si tu ne veux pas passer par une variable d'env.
 # Dans ce cas : repo en PRIVE obligatoire.
-   CLE_API = "COLLE_TA_CLE_PAPPERS_ICI"
+CLE_API = "cde2d8aff2614968747c3e5e858aa0bd077085f1bbc265a5"
 CODE_NAF = "56.10A"      # restauration traditionnelle
 CODE_POSTAL = "57000"    # Metz
 NB_PAR_EXECUTION = 5
