@@ -1,1 +1,43 @@
+name: Collecte prospects Metz
 
+on:
+  schedule:
+    # 23:00 UTC = 00:00 heure francaise en hiver, 01:00 en ete
+    - cron: "0 23 * * *"
+  workflow_dispatch:        # permet de lancer a la main depuis l'onglet Actions
+
+jobs:
+  collecte:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write       # autorise le commit dans le repo
+
+    steps:
+      - name: Recuperer le repo
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dependances
+        run: pip install requests
+
+      - name: Lancer la collecte
+        env:
+          PAPPERS_API_KEY: ${{ secrets.PAPPERS_API_KEY }}
+        run: python collecte_pappers.py
+
+      - name: Commiter les nouvelles donnees
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "Aucune nouvelle donnee, rien a commiter."
+          else
+            git commit -m "collecte Metz $(date +%Y-%m-%d)"
+            git push
+          fi
