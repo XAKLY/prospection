@@ -3,7 +3,7 @@ name: Collecte prospects Metz
 on:
   schedule:
     # 23:00 UTC = 00:00 heure francaise en hiver, 01:00 en ete
-    - cron: "56 17 * * *"
+    - cron: "0 17 * * *"
   workflow_dispatch:        # permet de lancer a la main depuis l'onglet Actions
 
 jobs:
