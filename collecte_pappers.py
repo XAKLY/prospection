@@ -41,7 +41,7 @@ DEBUG = True             # False une fois les champs verifies
 API = "https://api.pappers.fr/v2"
 KEY = os.environ.get("PAPPERS_API_KEY") or CLE_API
 
-if not KEY:
+if not KEY or KEY == "COLLE_TA_CLE_PAPPERS_ICI":
     sys.exit(
         "Cle API manquante : definis PAPPERS_API_KEY dans l'environnement "
         "ou renseigne CLE_API en haut du fichier."
