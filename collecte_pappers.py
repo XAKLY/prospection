@@ -4,7 +4,9 @@ Collecte 5 restaurants de Metz par exécution via l'API Pappers v2.
 Écrit/complète data/restaurants_metz.csv et mémorise la page dans data/state.json
 pour ne pas retomber sur les mêmes entreprises chaque jour.
 
-Usage : PAPPERS_API_KEY=xxx python collecte_pappers.py
+Deux façons de fournir la clé (la première trouvée gagne) :
+  1. variable d'environnement : PAPPERS_API_KEY=xxx python collecte_pappers.py
+  2. la constante CLE_API ci-dessous
 """
 
 import csv
@@ -17,10 +19,28 @@ from pathlib import Path
 
 import requests
 
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+
+# Colle ta clé Pappers ici si tu ne veux pas passer par une variable d'env.
+# Dans ce cas : repo en PRIVE obligatoire.
+CLE_API = "a5d0dc6d0b8e0693e92cb5526931d348acd729cabfaf8f04"
+
+CODE_NAF = "56.10A"      # restauration traditionnelle
+CODE_POSTAL = "57000"    # Metz
+NB_PAR_EXECUTION = 5
+
+# ---------------------------------------------------------------------------
+
 API = "https://api.pappers.fr/v2"
-KEY = os.environ.get("PAPPERS_API_KEY")
-if not KEY:
-    sys.exit("PAPPERS_API_KEY manquante dans l'environnement")
+KEY = os.environ.get("PAPPERS_API_KEY") or CLE_API
+
+if not KEY or KEY == "COLLE_TA_CLE_PAPPERS_ICI":
+    sys.exit(
+        "Cle API manquante : definis PAPPERS_API_KEY dans l'environnement "
+        "ou renseigne CLE_API en haut du fichier."
+    )
 
 HEADERS = {"api-key": KEY}
 DATA = Path("data")
@@ -36,6 +56,10 @@ CHAMPS = [
 
 def get(endpoint, **params):
     r = requests.get(f"{API}/{endpoint}", headers=HEADERS, params=params, timeout=30)
+    if r.status_code == 401:
+        sys.exit("Cle API refusee (401) - verifie qu'elle est active sur Pappers.")
+    if r.status_code == 429:
+        sys.exit("Quota depasse (429) - plus de credits ou trop de requetes.")
     r.raise_for_status()
     return r.json()
 
@@ -74,24 +98,24 @@ def main():
     nouvelles = []
     tentatives = 0
 
-    # On avance de page en page jusqu'à obtenir 5 entreprises inédites
-    while len(nouvelles) < 5 and tentatives < 10:
+    # On avance de page en page jusqu'a obtenir assez d'entreprises inedites
+    while len(nouvelles) < NB_PAR_EXECUTION and tentatives < 10:
         tentatives += 1
         res = get(
             "recherche",
-            code_naf="56.10A",        # restauration traditionnelle
-            code_postal="57000",      # Metz
+            code_naf=CODE_NAF,
+            code_postal=CODE_POSTAL,
             entreprise_cessee="false",
             par_page=10,
             page=page,
         )
         resultats = res.get("resultats", [])
         if not resultats:
-            print(f"Plus de résultats à la page {page}, arrêt.")
+            print(f"Plus de resultats a la page {page}, arret.")
             break
 
         for item in resultats:
-            if len(nouvelles) >= 5:
+            if len(nouvelles) >= NB_PAR_EXECUTION:
                 break
             siren = item.get("siren")
             if not siren or siren in vus:
@@ -123,7 +147,7 @@ def main():
         page += 1
 
     if not nouvelles:
-        print("Aucune nouvelle entreprise trouvée — rien n'est écrit.")
+        print("Aucune nouvelle entreprise trouvee - rien n'est ecrit.")
         return
 
     nouveau_fichier = not CSV_PATH.exists()
@@ -136,9 +160,10 @@ def main():
     state["page"] = page
     STATE_PATH.write_text(json.dumps(state, indent=2))
 
-    print(f"{len(nouvelles)} entreprises ajoutées à {CSV_PATH} :")
+    print(f"{len(nouvelles)} entreprises ajoutees a {CSV_PATH} :")
     for e in nouvelles:
-        print(f"  - {e['nom']} ({e['siren']}) — {e['dirigeants'] or 'dirigeants non renseignés'}")
+        dirigeants = e["dirigeants"] or "dirigeants non renseignes"
+        print(f"  - {e['nom']} ({e['siren']}) - {dirigeants}")
 
 
 if __name__ == "__main__":
