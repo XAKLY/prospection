@@ -2,29 +2,31 @@
 """
 Collecte de prospects (restaurants Metz) via l'API Pappers v2.
 
-COUT
-----
-Par defaut : 2 credits par execution. On n'utilise QUE /recherche.
-La route /recherche-dirigeants a ete retiree : elle facturait 10 credits.
+COUT REEL (mesure)
+------------------
+  /recherche                 = 2 credits par appel
+  /entreprise                = 1 credit par societe
+  /recherche-dirigeants      = 10 credits  -> ABANDONNE, retire du script
 
-Les dirigeants sont cherches automatiquement dans la reponse de /recherche
-(la fonction detecte toute liste de personnes, quel que soit le nom du champ).
-Les champs trouves sont affiches dans les logs sous [diagnostic].
+Configuration actuelle : 3 prospects par run avec dirigeants
+  -> 2 (recherche) + 3 (detail) = 5 credits par execution, ~150 par mois.
 
-Si /recherche ne les fournit vraiment pas, mettre ENRICHIR_ENTREPRISE = True :
-un appel /entreprise par societe, soit +1 credit chacune.
+Pour reduire : baisser NB_PAR_EXECUTION.
+Pour supprimer tout cout de detail : ENRICHIR_ENTREPRISE = False
+(2 credits par run, mais colonne dirigeants vide - /recherche ne les fournit pas).
 
 SORTIE
 ------
 data/restaurants_metz.csv  : fichier de prospection (append)
 data/state.json            : page courante
-data/debug_pappers.json    : (si DEBUG) reponse brute d'un resultat
+data/debug_pappers.json    : (si DEBUG) reponses brutes, pour inspection
 """
 
 import csv
 import json
 import os
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -39,11 +41,11 @@ CLE_API = "COLLE_TA_CLE_PAPPERS_ICI"
 
 CODE_NAF = "56.10A"          # 56.10A = restauration traditionnelle
 CODE_POSTAL = "57000"        # Metz
-NB_PAR_EXECUTION = 5         # nouveaux prospects par run
+NB_PAR_EXECUTION = 3         # 3 prospects = 5 credits par run
 
 EXCLURE_RADIEES = True       # ignore les societes radiees / inactives
 SIEGE_DANS_LA_ZONE = True    # exige que le SIEGE soit au CODE_POSTAL
-ENRICHIR_ENTREPRISE = False  # True = +1 credit par societe, mais dirigeants surs
+ENRICHIR_ENTREPRISE = True   # appel /entreprise pour obtenir les dirigeants
 DEBUG = True                 # ecrit debug_pappers.json (False ensuite)
 
 # ===========================================================================
@@ -69,12 +71,12 @@ CHAMPS = [
     "ville", "effectif", "statut", "dirigeants",
 ]
 
-appels = 0
+cout = 0        # estimation en credits
 debug = {}
 
 
-def get(endpoint, **params):
-    global appels
+def get(endpoint, prix, **params):
+    global cout
     r = requests.get(f"{API}/{endpoint}", headers=HEADERS,
                      params=params, timeout=30)
 
@@ -88,7 +90,7 @@ def get(endpoint, **params):
     if r.status_code >= 400:
         sys.exit(f"Erreur {r.status_code} sur {endpoint} : {r.text[:300]}")
 
-    appels += 1
+    cout += prix
     return r.json()
 
 
@@ -117,10 +119,9 @@ def sirens_deja_vus():
 
 
 # ---------------------------------------------------------------------------
-# Detection automatique des dirigeants
+# Detection des dirigeants (independante du nom du champ)
 # ---------------------------------------------------------------------------
 
-# indices qu'un dictionnaire decrit une personne
 INDICES_PERSONNE = {
     "nom", "prenom", "nom_complet", "qualite", "denomination",
     "prenom_usuel", "nom_usage", "fonction",
@@ -155,23 +156,19 @@ def formater(liste):
 
 
 def dirigeants_de(item, tracer=False):
-    """
-    Parcourt TOUS les champs de l'objet et retient la premiere liste
-    qui contient des personnes. Independant du nom du champ.
-    """
+    """Retient la premiere liste de l'objet qui contient des personnes."""
     for cle, valeur in item.items():
         if isinstance(valeur, list) and valeur:
             if any(ressemble_a_une_personne(x) for x in valeur):
                 texte = formater(valeur)
                 if texte:
                     if tracer:
-                        print(f"[diagnostic] dirigeants trouves dans le champ "
-                              f"'{cle}'")
+                        print(f"[diagnostic] dirigeants dans le champ '{cle}'")
                     return texte
     if tracer:
         listes = [k for k, v in item.items() if isinstance(v, list)]
-        print(f"[diagnostic] aucun dirigeant. Champs disponibles : "
-              f"{sorted(item.keys())}")
+        print(f"[diagnostic] aucun dirigeant trouve.")
+        print(f"[diagnostic] champs disponibles : {sorted(item.keys())}")
         print(f"[diagnostic] champs de type liste : {listes}")
     return ""
 
@@ -188,7 +185,7 @@ def est_active(item):
     return not item.get("entreprise_cessee")
 
 
-def extraire(item, tracer=False):
+def extraire(item):
     siege = item.get("siege") or {}
     return {
         "date_ajout": date.today().isoformat(),
@@ -208,7 +205,7 @@ def extraire(item, tracer=False):
         "ville": siege.get("ville", "") or item.get("ville", ""),
         "effectif": item.get("effectif", ""),
         "statut": item.get("statut_consolide", "") or item.get("statut_rcs", ""),
-        "dirigeants": dirigeants_de(item, tracer=tracer),
+        "dirigeants": dirigeants_de(item),
     }
 
 
@@ -222,16 +219,15 @@ def main():
 
     retenues = []
     tours = 0
-    premier = True
+    trace_faite = False
 
     while len(retenues) < NB_PAR_EXECUTION and tours < 10:
         tours += 1
         res = get(
-            "recherche",
+            "recherche", 2,
             code_naf=CODE_NAF,
             code_postal=CODE_POSTAL,
             entreprise_cessee="false",
-            precision="standard",
             par_page=20,
             page=page,
         )
@@ -259,8 +255,7 @@ def main():
                 vus.add(siren)
                 continue
 
-            ligne = extraire(item, tracer=premier)
-            premier = False
+            ligne = extraire(item)
 
             if SIEGE_DANS_LA_ZONE and ligne["code_postal"] != CODE_POSTAL:
                 print(f"[skip] {ligne['nom'] or siren} : siege hors {CODE_POSTAL} "
@@ -268,18 +263,28 @@ def main():
                 vus.add(siren)
                 continue
 
-            # Repli payant, desactive par defaut
+            # Detail : 1 credit, seule source fiable des dirigeants
             if ENRICHIR_ENTREPRISE and not ligne["dirigeants"]:
-                detail = get("entreprise", siren=siren)
+                detail = get("entreprise", 1, siren=siren)
                 if detail:
-                    ligne["dirigeants"] = dirigeants_de(detail)
+                    if DEBUG and "entreprise" not in debug:
+                        debug["entreprise"] = detail
+                    ligne["dirigeants"] = dirigeants_de(
+                        detail, tracer=not trace_faite
+                    )
+                    trace_faite = True
+                    # completer les champs vides avec le detail
+                    for cle, valeur in extraire(detail).items():
+                        if not ligne.get(cle) and valeur:
+                            ligne[cle] = valeur
+                time.sleep(0.3)
 
             retenues.append(ligne)
             vus.add(siren)
 
     if not retenues:
         print("Aucune nouvelle entreprise retenue - rien n'est ecrit.")
-        print(f"Appels API : {appels}")
+        print(f"Cout estime : {cout} credits")
         return
 
     nouveau = not CSV_PATH.exists()
@@ -305,7 +310,7 @@ def main():
     sans = sum(1 for e in retenues if not e["dirigeants"])
     if sans:
         print(f"\n[warn] {sans} ligne(s) sans dirigeant.")
-    print(f"\nAppels API : {appels}")
+    print(f"\nCout estime : {cout} credits")
     print(f"Prochaine execution : page {page}")
 
 
