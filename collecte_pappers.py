@@ -1,49 +1,54 @@
 #!/usr/bin/env python3
 """
-Collecte des restaurants de Metz via l'API Pappers v2.
+Collecte de prospects (restaurants Metz) via l'API Pappers v2.
 
-Optimisation credits : on tire le maximum de /recherche (1 credit par appel)
-et on n'appelle /entreprise (1 credit par societe) que si les dirigeants
-sont absents du resultat de recherche.
+STRATEGIE CREDITS
+-----------------
+AUCUN appel a /entreprise (qui coute 1 credit PAR societe). On utilise :
+  1. /recherche              -> les societes + un maximum de champs
+  2. /recherche-dirigeants   -> les dirigeants, en UN seul appel pour tout le lot
 
-Mettre ENRICHIR = False pour interdire totalement les appels /entreprise
-(colonne dirigeants potentiellement vide, mais cout garanti = 1 credit/run).
+Cout typique : 2 a 4 credits par execution, quel que soit NB_PAR_EXECUTION.
+Si /recherche renvoie deja les dirigeants, l'etape 2 est sautee.
 
-Le premier run ecrit data/debug_recherche.json : le JSON brut du premier
-resultat, pour verifier quels champs /recherche renvoie reellement.
+SORTIE
+------
+data/restaurants_metz.csv  : le fichier de prospection (append)
+data/state.json            : page courante, pour ne pas repasser sur les memes
+data/debug_pappers.json    : (si DEBUG) echantillons bruts des reponses API
 """
 
 import csv
 import json
 import os
 import sys
-import time
 from datetime import date
 from pathlib import Path
 
 import requests
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # CONFIGURATION
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-CLE_API = "cde2d8aff2614968747c3e5e858aa0bd077085f1bbc265a5"
+# Laisser le placeholder : la cle vient du secret GitHub PAPPERS_API_KEY
+CLE_API = "COLLE_TA_CLE_PAPPERS_ICI"
 
-CODE_NAF = "56.10A"      # restauration traditionnelle
-CODE_POSTAL = "57000"    # Metz
-NB_PAR_EXECUTION = 5
+CODE_NAF = "56.10A"       # 56.10A = restauration traditionnelle
+CODE_POSTAL = "57000"     # Metz
+NB_PAR_EXECUTION = 5      # nouveaux prospects par run
 
-ENRICHIR = True          # False = jamais d'appel /entreprise
-DEBUG = True             # False une fois les champs verifies
+EXCLURE_RADIEES = True    # ignore les societes radiees / inactives
+DEBUG = True              # ecrit des echantillons bruts (False ensuite)
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 API = "https://api.pappers.fr/v2"
 KEY = os.environ.get("PAPPERS_API_KEY") or CLE_API
 
-if not KEY or KEY == "COLLE_TA_CLE_PAPPERS_ICI":
+if not KEY or KEY.startswith("COLLE_TA_CLE"):
     sys.exit(
-        "Cle API manquante : definis PAPPERS_API_KEY dans l'environnement "
+        "Cle API manquante : definis le secret PAPPERS_API_KEY "
         "ou renseigne CLE_API en haut du fichier."
     )
 
@@ -51,89 +56,162 @@ HEADERS = {"api-key": KEY}
 DATA = Path("data")
 CSV_PATH = DATA / "restaurants_metz.csv"
 STATE_PATH = DATA / "state.json"
-DEBUG_PATH = DATA / "debug_recherche.json"
+DEBUG_PATH = DATA / "debug_pappers.json"
 
 CHAMPS = [
     "date_ajout", "siren", "siret_siege", "nom", "forme_juridique",
     "code_naf", "libelle_naf", "date_creation", "adresse", "code_postal",
-    "ville", "effectif", "chiffre_affaires", "dirigeants", "source",
+    "ville", "effectif", "statut", "dirigeants",
 ]
 
-credits_estimes = 0
+appels = 0
+debug = {}
 
 
 def get(endpoint, **params):
-    global credits_estimes
-    r = requests.get(f"{API}/{endpoint}", headers=HEADERS, params=params, timeout=30)
+    """Appel API avec compteur et messages d'erreur lisibles."""
+    global appels
+    r = requests.get(f"{API}/{endpoint}", headers=HEADERS,
+                     params=params, timeout=30)
+
     if r.status_code == 401:
-        sys.exit("Cle API refusee (401) - verifie qu'elle est active sur Pappers.")
+        sys.exit("Cle API refusee (401) : verifie qu'elle est active sur Pappers.")
+    if r.status_code == 404:
+        print(f"[info] endpoint {endpoint} introuvable (404), on continue sans.")
+        return None
     if r.status_code == 429:
-        sys.exit("Quota depasse (429) - plus de credits ou trop de requetes.")
-    r.raise_for_status()
-    credits_estimes += 1
+        sys.exit("Quota depasse (429) : plus de credits ou trop de requetes.")
+    if r.status_code >= 400:
+        sys.exit(f"Erreur {r.status_code} sur {endpoint} : {r.text[:300]}")
+
+    appels += 1
     return r.json()
 
 
+# ---------------------------------------------------------------------------
+# Etat et deduplication
+# ---------------------------------------------------------------------------
+
 def charger_state():
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
+        try:
+            return json.loads(STATE_PATH.read_text())
+        except json.JSONDecodeError:
+            print("[warn] state.json illisible, on repart de la page 1.")
     return {"page": 1}
 
 
 def sirens_deja_vus():
     if not CSV_PATH.exists():
         return set()
-    with CSV_PATH.open(encoding="utf-8") as f:
-        return {ligne["siren"] for ligne in csv.DictReader(f)}
+    try:
+        with CSV_PATH.open(encoding="utf-8") as f:
+            return {l["siren"] for l in csv.DictReader(f) if l.get("siren")}
+    except Exception as e:
+        print(f"[warn] lecture du CSV impossible ({e}), pas de deduplication.")
+        return set()
 
 
-def formater_dirigeants(source):
-    """Cherche les dirigeants sous les differents noms possibles."""
-    liste = (
-        source.get("representants")
-        or source.get("dirigeants")
-        or []
+# ---------------------------------------------------------------------------
+# Extraction
+# ---------------------------------------------------------------------------
+
+def nom_personne(d):
+    return (
+        d.get("nom_complet")
+        or " ".join(filter(None, [d.get("prenom"), d.get("nom")])).strip()
+        or d.get("denomination", "")
     )
+
+
+def formater_dirigeants(liste):
     out = []
-    for r in liste:
-        if not isinstance(r, dict):
+    for d in liste or []:
+        if not isinstance(d, dict):
             continue
-        nom = r.get("nom_complet") or " ".join(
-            filter(None, [r.get("prenom"), r.get("nom")])
-        )
-        qualite = r.get("qualite", "")
-        naissance = r.get("date_de_naissance_formate", "")
-        entree = " | ".join(filter(None, [nom.strip(), qualite, naissance]))
-        if entree:
+        entree = " | ".join(x for x in [nom_personne(d), d.get("qualite", "")] if x)
+        if entree and entree not in out:
             out.append(entree)
     return " ; ".join(out)
 
 
-def extraire(source, siren, source_label):
-    siege = source.get("siege") or {}
-    finances = (source.get("finances") or [{}])[0]
+def dirigeants_de(item):
+    """Cherche les dirigeants sous les differents noms de champ possibles."""
+    for cle in ("representants", "dirigeants", "representants_legaux"):
+        if item.get(cle):
+            return formater_dirigeants(item[cle])
+    return ""
+
+
+def est_active(item):
+    statut = (item.get("statut_consolide") or "").lower()
+    rcs = (item.get("statut_rcs") or "").lower()
+    if "inactif" in statut or "radi" in rcs:
+        return False
+    if item.get("entreprise_cessee"):
+        return False
+    return True
+
+
+def extraire(item):
+    siege = item.get("siege") or {}
     return {
         "date_ajout": date.today().isoformat(),
-        "siren": siren,
-        "siret_siege": siege.get("siret", "") or source.get("siret", ""),
+        "siren": item.get("siren", ""),
+        "siret_siege": siege.get("siret", "") or item.get("siret", ""),
         "nom": (
-            source.get("nom_entreprise")
-            or source.get("denomination")
-            or source.get("nom_complet", "")
+            item.get("nom_entreprise")
+            or item.get("denomination")
+            or item.get("nom_complet", "")
         ),
-        "forme_juridique": source.get("forme_juridique", ""),
-        "code_naf": source.get("code_naf", "") or siege.get("code_naf", ""),
-        "libelle_naf": source.get("libelle_code_naf", ""),
-        "date_creation": source.get("date_creation_formate", ""),
-        "adresse": siege.get("adresse_ligne_1", ""),
-        "code_postal": siege.get("code_postal", ""),
-        "ville": siege.get("ville", ""),
-        "effectif": source.get("effectif", ""),
-        "chiffre_affaires": finances.get("chiffre_affaires", ""),
-        "dirigeants": formater_dirigeants(source),
-        "source": source_label,
+        "forme_juridique": item.get("forme_juridique", ""),
+        "code_naf": item.get("code_naf", "") or siege.get("code_naf", ""),
+        "libelle_naf": item.get("libelle_code_naf", ""),
+        "date_creation": (item.get("date_creation_formate", "")
+                          or item.get("date_creation", "")),
+        "adresse": (siege.get("adresse_ligne_1", "")
+                    or item.get("adresse_ligne_1", "")),
+        "code_postal": siege.get("code_postal", "") or item.get("code_postal", ""),
+        "ville": siege.get("ville", "") or item.get("ville", ""),
+        "effectif": item.get("effectif", ""),
+        "statut": item.get("statut_consolide", "") or item.get("statut_rcs", ""),
+        "dirigeants": dirigeants_de(item),
     }
 
+
+# ---------------------------------------------------------------------------
+# Etape 2 : dirigeants en UN seul appel
+# ---------------------------------------------------------------------------
+
+def table_dirigeants(sirens):
+    """Retourne {siren: 'Nom | Qualite ; ...'} ; dict vide si la route echoue."""
+    if not sirens:
+        return {}
+
+    res = get(
+        "recherche-dirigeants",
+        code_naf=CODE_NAF,
+        code_postal=CODE_POSTAL,
+        par_page=100,
+        page=1,
+    )
+    if not res:
+        return {}
+
+    if DEBUG and res.get("resultats"):
+        debug["recherche_dirigeants"] = res["resultats"][0]
+
+    par_siren = {}
+    for d in res.get("resultats", []):
+        siren = d.get("siren") or (d.get("entreprise") or {}).get("siren")
+        if not siren or siren not in sirens:
+            continue
+        par_siren.setdefault(siren, []).append(d)
+
+    return {s: formater_dirigeants(v) for s, v in par_siren.items()}
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     DATA.mkdir(exist_ok=True)
@@ -141,73 +219,88 @@ def main():
     vus = sirens_deja_vus()
     page = state.get("page", 1)
 
-    nouvelles = []
-    tentatives = 0
-    debug_ecrit = False
+    retenues = []
+    tours = 0
 
-    while len(nouvelles) < NB_PAR_EXECUTION and tentatives < 10:
-        tentatives += 1
+    # --- Etape 1 : /recherche -----------------------------------------------
+    while len(retenues) < NB_PAR_EXECUTION and tours < 10:
+        tours += 1
         res = get(
             "recherche",
             code_naf=CODE_NAF,
             code_postal=CODE_POSTAL,
             entreprise_cessee="false",
-            par_page=10,
+            precision="standard",
+            par_page=20,
             page=page,
         )
+        page += 1
+
+        if not res:
+            break
         resultats = res.get("resultats", [])
         if not resultats:
-            print(f"Plus de resultats a la page {page}, arret.")
+            print(f"Plus de resultats (page {page - 1}), arret.")
             break
 
-        if DEBUG and not debug_ecrit:
-            DEBUG_PATH.write_text(
-                json.dumps(resultats[0], indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            debug_ecrit = True
-            print(f"[debug] premier resultat brut ecrit dans {DEBUG_PATH}")
+        if DEBUG and "recherche" not in debug:
+            debug["recherche"] = resultats[0]
 
         for item in resultats:
-            if len(nouvelles) >= NB_PAR_EXECUTION:
+            if len(retenues) >= NB_PAR_EXECUTION:
                 break
             siren = item.get("siren")
             if not siren or siren in vus:
                 continue
-
-            ligne = extraire(item, siren, "recherche")
-
-            # Appel detail UNIQUEMENT si la recherche n'a pas donne les dirigeants
-            if ENRICHIR and not ligne["dirigeants"]:
-                detail = get("entreprise", siren=siren)
-                ligne = extraire(detail, siren, "entreprise")
-                time.sleep(0.3)
-
-            nouvelles.append(ligne)
+            if EXCLURE_RADIEES and not est_active(item):
+                print(f"[skip] {item.get('nom_entreprise', siren)} : radiee/inactive")
+                vus.add(siren)
+                continue
+            retenues.append(extraire(item))
             vus.add(siren)
 
-        page += 1
-
-    if not nouvelles:
+    if not retenues:
         print("Aucune nouvelle entreprise trouvee - rien n'est ecrit.")
-        print(f"Credits consommes (estimation) : {credits_estimes}")
+        print(f"Appels API : {appels}")
         return
 
-    nouveau_fichier = not CSV_PATH.exists()
+    # --- Etape 2 : dirigeants manquants -------------------------------------
+    manquants = {l["siren"] for l in retenues if not l["dirigeants"]}
+    if manquants:
+        print(f"[info] dirigeants absents pour {len(manquants)} societe(s), "
+              f"appel unique a /recherche-dirigeants...")
+        table = table_dirigeants(manquants)
+        for ligne in retenues:
+            if not ligne["dirigeants"]:
+                ligne["dirigeants"] = table.get(ligne["siren"], "")
+
+    # --- Ecriture -----------------------------------------------------------
+    nouveau = not CSV_PATH.exists()
     with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CHAMPS)
-        if nouveau_fichier:
+        if nouveau:
             w.writeheader()
-        w.writerows(nouvelles)
+        w.writerows(retenues)
 
     state["page"] = page
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+    STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
-    print(f"{len(nouvelles)} entreprises ajoutees a {CSV_PATH} :")
-    for e in nouvelles:
-        dirigeants = e["dirigeants"] or "dirigeants non renseignes"
-        print(f"  - {e['nom']} ({e['siren']}) [{e['source']}] - {dirigeants}")
-    print(f"Credits consommes (estimation) : {credits_estimes}")
+    if DEBUG and debug:
+        DEBUG_PATH.write_text(
+            json.dumps(debug, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    # --- Rapport ------------------------------------------------------------
+    print(f"\n{len(retenues)} entreprise(s) ajoutee(s) dans {CSV_PATH} :\n")
+    for e in retenues:
+        print(f"  {e['nom']} ({e['siren']})")
+        print(f"    {e['adresse']}, {e['code_postal']} {e['ville']}")
+        print(f"    dirigeants : {e['dirigeants'] or 'non renseignes'}")
+    sans = sum(1 for e in retenues if not e["dirigeants"])
+    if sans:
+        print(f"\n[warn] {sans} ligne(s) sans dirigeant.")
+    print(f"\nAppels API (= credits environ) : {appels}")
+    print(f"Prochaine execution : page {page}")
 
 
 if __name__ == "__main__":
