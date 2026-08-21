@@ -2,8 +2,8 @@ name: Collecte prospects Metz
 
 on:
   schedule:
-    - cron: "0 17 * * *"
-  workflow_dispatch:        # permet de lancer a la main depuis l'onglet Actions
+    - cron: "53 11 * * *"
+  workflow_dispatch:
 
 jobs:
   collecte:
