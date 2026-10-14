@@ -1,8 +1,6 @@
 name: Collecte prospects Metz
 
 on:
-  schedule:
-    - cron: "53 11 * * *"
   workflow_dispatch:
 
 jobs:
@@ -10,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write       # autorise le commit dans le repo
+      contents: write
 
     steps:
       - name: Recuperer le repo
