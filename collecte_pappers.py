@@ -52,7 +52,7 @@ CODES_NAF = [
 ]
 
 CODE_POSTAL = "57000"
-NB_PAR_EXECUTION = 20
+NB_PAR_EXECUTION = 5
 
 EXCLURE_RADIEES = True
 SIEGE_DANS_LA_ZONE = True
@@ -342,8 +342,8 @@ def extraire(item):
            or item.get("nom_complet", ""))
     ligne = {
         "date_ajout": date.today().isoformat(),
-        "siren": item.get("siren", ""),
-        "siret_siege": siege.get("siret", "") or item.get("siret", ""),
+        "siren": str(item.get("siren", "") or ""),
+        "siret_siege": str(siege.get("siret", "") or item.get("siret", "") or ""),
         "nom": nom,
         "raison_sociale": item.get("denomination") or nom,
         "forme_juridique": item.get("forme_juridique", ""),
@@ -430,9 +430,28 @@ def ecrire_xlsx(lignes, sirens_nouveaux):
                                        wrap_text=True)
         cellule.border = bordure
 
+    # Forcer le format texte sur les colonnes SIREN/SIRET/telephone/code_postal
+    # AVANT d'ecrire les donnees, sinon openpyxl les convertit en int
+    # et les zeros a gauche sont perdus.
+    for nom_col in ("siren", "siret_siege", "telephone",
+                    "dirigeant_code_postal"):
+        if nom_col not in CHAMPS:
+            continue
+        idx = CHAMPS.index(nom_col) + 1
+        lettre = get_column_letter(idx)
+        ws.column_dimensions[lettre].number_format = "@"
+
     # --- Donnees (a partir de la ligne 3) ---
     for ligne in lignes:
-        ws.append([ligne.get(c, "") for c in CHAMPS])
+        valeurs = []
+        for c in CHAMPS:
+            val = ligne.get(c, "")
+            # Forcer les champs sensibles en texte pour preserver les zeros
+            if c in ("siren", "siret_siege", "telephone",
+                     "dirigeant_code_postal"):
+                val = str(val) if val != "" and val is not None else ""
+            valeurs.append(val)
+        ws.append(valeurs)
         nouveau = ligne.get("siren") in sirens_nouveaux
         for c in ws[ws.max_row]:
             c.font = police
@@ -440,7 +459,7 @@ def ecrire_xlsx(lignes, sirens_nouveaux):
             if nouveau:
                 c.fill = vert
 
-    # Format texte pour les colonnes numeriques (SIREN, SIRET, telephone)
+    # Double securite : reforcer le format texte sur SIREN/SIRET/telephone
     for nom_col in ("siren", "siret_siege", "telephone",
                     "dirigeant_code_postal"):
         if nom_col not in CHAMPS:
