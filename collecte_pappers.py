@@ -11,7 +11,7 @@ COMPORTEMENT
     * le DIRIGEANT PRINCIPAL : nom, prenom, poste (qualite), adresse,
       code postal, ville (chacun dans sa propre colonne)
     * e-mail, telephone, site web (si Pappers les fournit)
-    * annee d'ouverture, effectif, chiffre d'affaires + annee, resultat
+    * annee d'ouverture, effectif, chiffre d'affaires + annee
   -> colonnes pensees pour l'import dans Odoo CRM (lead + contact).
 - Genere data/restaurants_metz.xlsx : lignes du run en VERT.
   L'en-tete Excel est colore par categorie d'information.
@@ -92,7 +92,7 @@ CHAMPS = [
     # --- Localisation ---
     "adresse", "code_postal", "ville",
     # --- Finances ---
-    "effectif", "chiffre_affaires", "annee_ca", "resultat",
+    "effectif", "chiffre_affaires", "annee_ca",
     # --- Contact ---
     "email", "telephone", "site_web", "statut",
     # --- Dirigeant principal ---
@@ -124,7 +124,7 @@ CATEGORIES = [
     {
         "libelle": "FINANCES",
         "couleur": "B45309",       # orange fonce
-        "colonnes": ["effectif", "chiffre_affaires", "annee_ca", "resultat"],
+        "colonnes": ["effectif", "chiffre_affaires", "annee_ca"],
     },
     {
         "libelle": "CONTACT",
@@ -290,7 +290,7 @@ def extraire_dirigeant_principal(item):
 # ---------------------------------------------------------------------------
 
 def derniere_finance(item):
-    """Dernier exercice publie (chiffre d'affaires, resultat, annee)."""
+    """Dernier exercice publie (chiffre d'affaires, annee)."""
     fin = item.get("finances")
     if not isinstance(fin, list) or not fin:
         return {}
@@ -359,7 +359,6 @@ def extraire(item):
         "effectif": item.get("effectif", "") or item.get("tranche_effectif", ""),
         "chiffre_affaires": fin.get("chiffre_affaires", "") if fin else "",
         "annee_ca": fin.get("annee", "") if fin else "",
-        "resultat": fin.get("resultat", "") if fin else "",
         "email": premier(item, siege, "email", "adresse_email"),
         "telephone": premier(item, siege, "telephone", "numero_telephone"),
         "site_web": premier(item, siege, "site_internet", "site_web"),
@@ -475,7 +474,7 @@ def ecrire_xlsx(lignes, sirens_nouveaux):
         "raison_sociale": 30, "forme_juridique": 28, "code_naf": 9,
         "libelle_naf": 28, "date_creation": 13, "annee_ouverture": 10,
         "adresse": 34, "code_postal": 11, "ville": 18, "effectif": 22,
-        "chiffre_affaires": 14, "annee_ca": 8, "resultat": 12,
+        "chiffre_affaires": 14, "annee_ca": 8,
         "email": 30, "telephone": 16, "site_web": 26, "statut": 9,
         "dirigeant_nom": 18, "dirigeant_prenom": 16, "dirigeant_poste": 30,
         "dirigeant_adresse": 30, "dirigeant_code_postal": 11,
