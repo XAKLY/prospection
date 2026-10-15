@@ -8,8 +8,8 @@ COMPORTEMENT
 - Deduplication par SIREN sur data/restaurants_metz.csv.
 - Parcourt TOUS les codes NAF de restauration (pas seulement 56.10A).
 - Recupere pour chaque societe :
-    * jusqu'a 5 DIRIGEANTS, chacun avec ses propres colonnes :
-      nom, prenom, poste (qualite), adresse, code postal, ville
+    * le DIRIGEANT PRINCIPAL : nom, prenom, poste (qualite), adresse,
+      code postal, ville (chacun dans sa propre colonne)
     * e-mail, telephone, site web (si Pappers les fournit)
     * annee d'ouverture, effectif, chiffre d'affaires + annee, resultat
   -> colonnes pensees pour l'import dans Odoo CRM (lead + contact).
@@ -52,8 +52,7 @@ CODES_NAF = [
 ]
 
 CODE_POSTAL = "57000"
-NB_PAR_EXECUTION = 5
-MAX_DIRIGEANTS = 5
+NB_PAR_EXECUTION = 20
 
 EXCLURE_RADIEES = True
 SIEGE_DANS_LA_ZONE = True
@@ -84,36 +83,23 @@ DEBUG_PATH = DATA / "debug_pappers.json"
 # DEFINITION DES COLONNES ET CATEGORIES COLOREES
 # ===========================================================================
 
-# Construit dynamiquement les colonnes dirigeant
-def _construire_champs():
-    champs = [
-        # --- Entreprise ---
-        "date_ajout", "siren", "siret_siege", "nom", "raison_sociale",
-        "forme_juridique",
-        # --- Activite ---
-        "code_naf", "libelle_naf", "date_creation", "annee_ouverture",
-        # --- Localisation ---
-        "adresse", "code_postal", "ville",
-        # --- Finances ---
-        "effectif", "chiffre_affaires", "annee_ca", "resultat",
-        # --- Contact ---
-        "email", "telephone", "site_web", "statut",
-    ]
-    # --- Dirigeants (un groupe de colonnes par dirigeant) ---
-    for i in range(1, MAX_DIRIGEANTS + 1):
-        champs += [
-            f"dirigeant_{i}_nom",
-            f"dirigeant_{i}_prenom",
-            f"dirigeant_{i}_poste",
-            f"dirigeant_{i}_adresse",
-            f"dirigeant_{i}_code_postal",
-            f"dirigeant_{i}_ville",
-        ]
-    champs.append("nombre_dirigeants")
-    return champs
+CHAMPS = [
+    # --- Entreprise ---
+    "date_ajout", "siren", "siret_siege", "nom", "raison_sociale",
+    "forme_juridique",
+    # --- Activite ---
+    "code_naf", "libelle_naf", "date_creation", "annee_ouverture",
+    # --- Localisation ---
+    "adresse", "code_postal", "ville",
+    # --- Finances ---
+    "effectif", "chiffre_affaires", "annee_ca", "resultat",
+    # --- Contact ---
+    "email", "telephone", "site_web", "statut",
+    # --- Dirigeant principal ---
+    "dirigeant_nom", "dirigeant_prenom", "dirigeant_poste",
+    "dirigeant_adresse", "dirigeant_code_postal", "dirigeant_ville",
+]
 
-
-CHAMPS = _construire_champs()
 
 # Categories pour les couleurs d'en-tete Excel
 # Chaque categorie : nom affiche, couleur de fond, liste des colonnes
@@ -148,8 +134,9 @@ CATEGORIES = [
     {
         "libelle": "DIRIGEANTS",
         "couleur": "7C2D12",       # rouge-marron fonce
-        "colonnes": [c for c in CHAMPS
-                     if c.startswith("dirigeant_") or c == "nombre_dirigeants"],
+        "colonnes": ["dirigeant_nom", "dirigeant_prenom", "dirigeant_poste",
+                      "dirigeant_adresse", "dirigeant_code_postal",
+                      "dirigeant_ville"],
     },
 ]
 
@@ -265,48 +252,37 @@ def score_dirigeant(d):
     return (morale, rang)
 
 
-def extraire_dirigeants(item):
+def extraire_dirigeant_principal(item):
     """
-    Retourne un dict avec les colonnes dirigeant_1_* ... dirigeant_5_*
-    et nombre_dirigeants.
-    Chaque dirigeant a ses propres colonnes : nom, prenom, poste, adresse,
-    code postal, ville.
+    Retourne un dict avec les colonnes du dirigeant principal :
+    dirigeant_nom, dirigeant_prenom, dirigeant_poste, dirigeant_adresse,
+    dirigeant_code_postal, dirigeant_ville.
     """
     reps = liste_representants(item)
-    resultat = {}
-
-    # Colonnes vides par defaut
-    for i in range(1, MAX_DIRIGEANTS + 1):
-        resultat[f"dirigeant_{i}_nom"] = ""
-        resultat[f"dirigeant_{i}_prenom"] = ""
-        resultat[f"dirigeant_{i}_poste"] = ""
-        resultat[f"dirigeant_{i}_adresse"] = ""
-        resultat[f"dirigeant_{i}_code_postal"] = ""
-        resultat[f"dirigeant_{i}_ville"] = ""
-
-    resultat["nombre_dirigeants"] = 0
-
+    vide = {
+        "dirigeant_nom": "",
+        "dirigeant_prenom": "",
+        "dirigeant_poste": "",
+        "dirigeant_adresse": "",
+        "dirigeant_code_postal": "",
+        "dirigeant_ville": "",
+    }
     if not reps:
-        return resultat
-
-    # Trier par score (meilleur en premier)
-    reps_tries = sorted(reps, key=score_dirigeant)
-    resultat["nombre_dirigeants"] = len(reps_tries)
-
-    for i, d in enumerate(reps_tries[:MAX_DIRIGEANTS], start=1):
-        nom = d.get("nom") or ""
-        prenom = d.get("prenom") or d.get("prenom_usuel") or ""
-        if not nom and not prenom:
-            nom = nom_personne(d)
-        prefix = f"dirigeant_{i}_"
-        resultat[prefix + "nom"] = str(nom).strip()
-        resultat[prefix + "prenom"] = str(prenom).strip()
-        resultat[prefix + "poste"] = poste_de(d)
-        resultat[prefix + "adresse"] = d.get("adresse_ligne_1") or ""
-        resultat[prefix + "code_postal"] = d.get("code_postal") or ""
-        resultat[prefix + "ville"] = d.get("ville") or ""
-
-    return resultat
+        return vide
+    # Choisir le meilleur dirigeant (personne physique, poste cle)
+    d = sorted(reps, key=score_dirigeant)[0]
+    nom = d.get("nom") or ""
+    prenom = d.get("prenom") or d.get("prenom_usuel") or ""
+    if not nom and not prenom:
+        nom = nom_personne(d)
+    return {
+        "dirigeant_nom": str(nom).strip(),
+        "dirigeant_prenom": str(prenom).strip(),
+        "dirigeant_poste": poste_de(d),
+        "dirigeant_adresse": d.get("adresse_ligne_1") or "",
+        "dirigeant_code_postal": d.get("code_postal") or "",
+        "dirigeant_ville": d.get("ville") or "",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +365,8 @@ def extraire(item):
         "site_web": premier(item, siege, "site_internet", "site_web"),
         "statut": item.get("statut_consolide", "") or item.get("statut_rcs", ""),
     }
-    # Dirigeants : un groupe de colonnes par dirigeant
-    ligne.update(extraire_dirigeants(item))
+    # Dirigeant principal
+    ligne.update(extraire_dirigeant_principal(item))
     return ligne
 
 
@@ -466,9 +442,7 @@ def ecrire_xlsx(lignes, sirens_nouveaux):
 
     # Format texte pour les colonnes numeriques (SIREN, SIRET, telephone)
     for nom_col in ("siren", "siret_siege", "telephone",
-                    "dirigeant_1_code_postal", "dirigeant_2_code_postal",
-                    "dirigeant_3_code_postal", "dirigeant_4_code_postal",
-                    "dirigeant_5_code_postal"):
+                    "dirigeant_code_postal"):
         if nom_col not in CHAMPS:
             continue
         idx = CHAMPS.index(nom_col) + 1
@@ -484,16 +458,9 @@ def ecrire_xlsx(lignes, sirens_nouveaux):
         "adresse": 34, "code_postal": 11, "ville": 18, "effectif": 22,
         "chiffre_affaires": 14, "annee_ca": 8, "resultat": 12,
         "email": 30, "telephone": 16, "site_web": 26, "statut": 9,
-        "nombre_dirigeants": 10,
-    }
-    # Largeurs pour les colonnes dirigeant
-    for i in range(1, MAX_DIRIGEANTS + 1):
-        largeurs[f"dirigeant_{i}_nom"] = 18
-        largeurs[f"dirigeant_{i}_prenom"] = 16
-        largeurs[f"dirigeant_{i}_poste"] = 30
-        largeurs[f"dirigeant_{i}_adresse"] = 30
-        largeurs[f"dirigeant_{i}_code_postal"] = 11
-        largeurs[f"dirigeant_{i}_ville"] = 16
+        "dirigeant_nom": 18, "dirigeant_prenom": 16, "dirigeant_poste": 30,
+        "dirigeant_adresse": 30, "dirigeant_code_postal": 11,
+        "dirigeant_ville": 16,
 
     for i, nom_col in enumerate(CHAMPS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = largeurs.get(
@@ -630,14 +597,12 @@ def main():
     for e in retenues:
         print(f"  {e['nom']} ({e['siren']}) [{e['code_naf']}]")
         print(f"    {e['adresse']}, {e['code_postal']} {e['ville']}")
-        nb_dir = e.get("nombre_dirigeants", 0)
-        if nb_dir > 0:
-            for i in range(1, min(nb_dir, MAX_DIRIGEANTS) + 1):
-                prenom = e.get(f"dirigeant_{i}_prenom", "")
-                nom = e.get(f"dirigeant_{i}_nom", "")
-                poste = e.get(f"dirigeant_{i}_poste", "")
-                print(f"    dirigeant {i} : {prenom} {nom} - "
-                      f"{poste or 'poste non renseigne'}")
+        prenom = e.get("dirigeant_prenom", "")
+        nom = e.get("dirigeant_nom", "")
+        poste = e.get("dirigeant_poste", "")
+        if nom or prenom:
+            print(f"    dirigeant : {prenom} {nom} - "
+                  f"{poste or 'poste non renseigne'}")
         else:
             print(f"    dirigeant : aucun renseigne")
         print(f"    contact   : {e['email'] or '-'} / "
@@ -645,7 +610,7 @@ def main():
         ca = e["chiffre_affaires"]
         print(f"    CA        : {ca if ca != '' else '-'} "
               f"({e['annee_ca'] or '-'})")
-    sans = sum(1 for e in retenues if not e.get("dirigeant_1_nom"))
+    sans = sum(1 for e in retenues if not e.get("dirigeant_nom"))
     if sans:
         print(f"\n[warn] {sans} ligne(s) sans dirigeant.")
     print(f"\nFichiers : {CSV_PATH} et {XLSX_PATH}")
