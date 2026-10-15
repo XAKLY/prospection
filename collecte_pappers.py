@@ -460,7 +460,7 @@ def ecrire_xlsx(lignes, sirens_nouveaux):
         "email": 30, "telephone": 16, "site_web": 26, "statut": 9,
         "dirigeant_nom": 18, "dirigeant_prenom": 16, "dirigeant_poste": 30,
         "dirigeant_adresse": 30, "dirigeant_code_postal": 11,
-        "dirigeant_ville": 16,
+        "dirigeant_ville": 16,}
 
     for i, nom_col in enumerate(CHAMPS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = largeurs.get(
