@@ -20,7 +20,7 @@ jobs:
           python-version: "3.12"
 
       - name: Installer les dependances
-        run: pip install requests
+        run: pip install requests openpyxl
 
       - name: Lancer la collecte
         env:
