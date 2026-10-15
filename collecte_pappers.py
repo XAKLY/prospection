@@ -4,30 +4,20 @@ Collecte de prospects (restaurants Metz) via l'API Pappers v2.
 
 COMPORTEMENT
 ------------
-- Ajoute 5 NOUVEAUX restaurants a chaque execution (NB_PAR_EXECUTION).
-- Ne reprend jamais un restaurant deja present dans data/restaurants_metz.csv
-  (deduplication par SIREN).
-- Colonne "date_ajout" = date du jour d'ajout de chaque restaurant.
-- Genere data/restaurants_metz.xlsx : les 5 lignes ajoutees pendant
-  l'execution sont en VERT, toutes les lignes precedentes sont sans couleur.
-  (Un CSV ne peut pas contenir de couleurs : c'est pour cela qu'un .xlsx
-  est genere a cote. Le CSV reste la base de donnees / source de dedup.)
+- Ajoute NB_PAR_EXECUTION NOUVEAUX restaurants a chaque execution.
+- Deduplication par SIREN sur data/restaurants_metz.csv.
+- Recupere pour chaque societe :
+    * le DIRIGEANT PRINCIPAL : nom, prenom, poste (qualite), adresse
+    * la liste complete des dirigeants
+    * e-mail, telephone, site web (si Pappers les fournit)
+    * annee d'ouverture, effectif, chiffre d'affaires + annee, resultat
+  -> colonnes pensees pour l'import dans Odoo CRM (lead + contact).
+- Genere data/restaurants_metz.xlsx : lignes du run en VERT.
 
-COUT (mesure)
--------------
-  /recherche   = 2 credits par appel (20 resultats)
-  /entreprise  = 1 credit par societe (pour obtenir les dirigeants)
-  -> 5 restaurants = 2 + 5 = 7 credits par execution (9 si une 2e page
-     de recherche est necessaire).
-Pour supprimer le cout du detail : ENRICHIR_ENTREPRISE = False
-(colonne dirigeants alors vide).
-
-SORTIES
--------
-data/restaurants_metz.csv   : base de prospection (append)
-data/restaurants_metz.xlsx  : meme contenu, nouvelles lignes en vert
-data/state.json             : page courante
-data/debug_pappers.json     : (si DEBUG) reponses brutes
+COUT
+----
+  /recherche  = 2 credits par appel (20 resultats)
+  /entreprise = 1 credit par societe (dirigeants, finances, contacts)
 """
 
 import csv
@@ -47,19 +37,19 @@ from openpyxl.utils import get_column_letter
 # CONFIGURATION
 # ===========================================================================
 
-# Laisser le placeholder : la cle vient du secret GitHub PAPPERS_API_KEY
-CLE_API = "COLLE_TA_CLE_PAPPERS_ICI"
+CLE_API = "COLLE_TA_CLE_PAPPERS_ICI"   # ou secret GitHub PAPPERS_API_KEY
 
-CODE_NAF = "56.10A"          # 56.10A = restauration traditionnelle
-CODE_POSTAL = "57000"        # Metz
-NB_PAR_EXECUTION = 5         # 5 nouveaux restaurants par run
+CODE_NAF = "56.10A"
+CODE_POSTAL = "57000"
+NB_PAR_EXECUTION = 5
 
-EXCLURE_RADIEES = True       # ignore les societes radiees / inactives
-SIEGE_DANS_LA_ZONE = True    # exige que le SIEGE soit au CODE_POSTAL
-ENRICHIR_ENTREPRISE = True   # appel /entreprise pour obtenir les dirigeants
-DEBUG = False                # True : ecrit debug_pappers.json
+EXCLURE_RADIEES = True
+SIEGE_DANS_LA_ZONE = True
+ENRICHIR_ENTREPRISE = True
+DEBUG = False                # True : ecrit debug_pappers.json (a utiliser si
+                             # une colonne reste vide, pour voir les vrais champs)
 
-COULEUR_NOUVEAU = "C6EFCE"   # vert clair (style "Bon" d'Excel)
+COULEUR_NOUVEAU = "C6EFCE"
 
 # ===========================================================================
 
@@ -80,12 +70,17 @@ STATE_PATH = DATA / "state.json"
 DEBUG_PATH = DATA / "debug_pappers.json"
 
 CHAMPS = [
-    "date_ajout", "siren", "siret_siege", "nom", "forme_juridique",
-    "code_naf", "libelle_naf", "date_creation", "adresse", "code_postal",
-    "ville", "effectif", "statut", "dirigeants",
+    "date_ajout", "siren", "siret_siege", "nom", "raison_sociale",
+    "forme_juridique", "code_naf", "libelle_naf", "date_creation",
+    "annee_ouverture", "adresse", "code_postal", "ville", "effectif",
+    "chiffre_affaires", "annee_ca", "resultat",
+    "email", "telephone", "site_web", "statut",
+    "dirigeant_nom", "dirigeant_prenom", "dirigeant_poste",
+    "dirigeant_adresse", "dirigeant_code_postal", "dirigeant_ville",
+    "dirigeants",
 ]
 
-cout = 0        # estimation en credits
+cout = 0
 debug = {}
 
 
@@ -122,7 +117,6 @@ def charger_state():
 
 
 def lire_csv():
-    """Retourne toutes les lignes deja presentes dans le CSV."""
     if not CSV_PATH.exists():
         return []
     try:
@@ -134,13 +128,20 @@ def lire_csv():
 
 
 # ---------------------------------------------------------------------------
-# Detection des dirigeants
+# Dirigeants
 # ---------------------------------------------------------------------------
 
 INDICES_PERSONNE = {
     "nom", "prenom", "nom_complet", "qualite", "denomination",
     "prenom_usuel", "nom_usage", "fonction",
 }
+
+# Ordre de preference pour choisir le "dirigeant principal"
+PRIORITE_POSTES = [
+    "gerant", "gérant", "president", "président", "directeur general",
+    "directeur général", "dirigeant", "associe unique", "associé unique",
+    "pouvoir d'engager",
+]
 
 
 def ressemble_a_une_personne(d):
@@ -155,40 +156,105 @@ def nom_personne(d):
     return " ".join(str(m) for m in morceaux if m).strip()
 
 
-def formater(liste):
-    out = []
-    for d in liste:
-        if not ressemble_a_une_personne(d):
-            continue
-        nom = nom_personne(d)
-        if not nom:
-            continue
-        qualite = d.get("qualite") or d.get("fonction") or ""
-        entree = " | ".join(x for x in [nom, str(qualite)] if x)
-        if entree not in out:
-            out.append(entree)
-    return " ; ".join(out)
+def poste_de(d):
+    return str(d.get("qualite") or d.get("fonction") or "").strip()
 
 
-def dirigeants_de(item, tracer=False):
-    """
-    Cherche uniquement dans les champs 'representants' / 'dirigeants'
-    (evite de prendre par erreur les conventions collectives, etc.).
-    """
+def liste_representants(item):
+    """Retourne la liste brute des dirigeants/representants d'un item."""
     for cle, valeur in item.items():
         if not isinstance(valeur, list) or not valeur:
             continue
         if "representant" not in cle and "dirigeant" not in cle:
             continue
-        texte = formater(valeur)
-        if texte:
-            if tracer:
-                print(f"[diagnostic] dirigeants dans le champ '{cle}'")
-            return texte
-    if tracer:
-        listes = [k for k, v in item.items() if isinstance(v, list)]
-        print("[diagnostic] aucun dirigeant trouve.")
-        print(f"[diagnostic] champs de type liste : {listes}")
+        pers = [d for d in valeur if ressemble_a_une_personne(d)]
+        if pers:
+            return pers
+    return []
+
+
+def formater(liste):
+    out = []
+    for d in liste:
+        nom = nom_personne(d)
+        if not nom:
+            continue
+        entree = " | ".join(x for x in [nom, poste_de(d)] if x)
+        if entree not in out:
+            out.append(entree)
+    return " ; ".join(out)
+
+
+def score_dirigeant(d):
+    """Plus petit = meilleur. Prefere une personne physique avec un poste cle."""
+    morale = 1 if d.get("personne_morale") else 0
+    poste = poste_de(d).lower()
+    rang = len(PRIORITE_POSTES)
+    for i, mot in enumerate(PRIORITE_POSTES):
+        if mot in poste:
+            rang = i
+            break
+    return (morale, rang)
+
+
+def dirigeant_principal(item):
+    reps = liste_representants(item)
+    vide = {k: "" for k in (
+        "dirigeant_nom", "dirigeant_prenom", "dirigeant_poste",
+        "dirigeant_adresse", "dirigeant_code_postal", "dirigeant_ville")}
+    if not reps:
+        return vide
+    d = sorted(reps, key=score_dirigeant)[0]
+    nom = d.get("nom") or ""
+    prenom = d.get("prenom") or d.get("prenom_usuel") or ""
+    if not nom and not prenom:
+        # personne morale ou champ nom_complet seul
+        nom = nom_personne(d)
+    return {
+        "dirigeant_nom": str(nom).strip(),
+        "dirigeant_prenom": str(prenom).strip(),
+        "dirigeant_poste": poste_de(d),
+        "dirigeant_adresse": d.get("adresse_ligne_1") or "",
+        "dirigeant_code_postal": d.get("code_postal") or "",
+        "dirigeant_ville": d.get("ville") or "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Finances / contacts
+# ---------------------------------------------------------------------------
+
+def derniere_finance(item):
+    """Dernier exercice publie (chiffre d'affaires, resultat, annee)."""
+    fin = item.get("finances")
+    if not isinstance(fin, list) or not fin:
+        return {}
+    fin = [f for f in fin if isinstance(f, dict)]
+    if not fin:
+        return {}
+    avec_ca = [f for f in fin if f.get("chiffre_affaires") is not None]
+    base = avec_ca or fin
+    return max(base, key=lambda f: f.get("annee") or 0)
+
+
+def premier(item, siege, *cles):
+    """Premiere valeur non vide parmi plusieurs cles, au niveau societe puis siege."""
+    for src in (item, siege):
+        for c in cles:
+            v = src.get(c)
+            if v:
+                return str(v).strip()
+    return ""
+
+
+def annee_ouverture(item):
+    d = item.get("date_creation") or item.get("date_creation_formate") or ""
+    d = str(d)
+    # formats : 2024-03-01 ou 01/03/2024
+    if len(d) >= 4 and d[:4].isdigit():
+        return d[:4]
+    if len(d) >= 4 and d[-4:].isdigit():
+        return d[-4:]
     return ""
 
 
@@ -206,34 +272,45 @@ def est_active(item):
 
 def extraire(item):
     siege = item.get("siege") or {}
-    return {
+    fin = derniere_finance(item)
+    nom = (item.get("nom_entreprise")
+           or item.get("denomination")
+           or item.get("nom_complet", ""))
+    ligne = {
         "date_ajout": date.today().isoformat(),
         "siren": item.get("siren", ""),
         "siret_siege": siege.get("siret", "") or item.get("siret", ""),
-        "nom": (item.get("nom_entreprise")
-                or item.get("denomination")
-                or item.get("nom_complet", "")),
+        "nom": nom,
+        "raison_sociale": item.get("denomination") or nom,
         "forme_juridique": item.get("forme_juridique", ""),
         "code_naf": item.get("code_naf", "") or siege.get("code_naf", ""),
         "libelle_naf": item.get("libelle_code_naf", ""),
         "date_creation": (item.get("date_creation_formate", "")
                           or item.get("date_creation", "")),
+        "annee_ouverture": annee_ouverture(item),
         "adresse": (siege.get("adresse_ligne_1", "")
                     or item.get("adresse_ligne_1", "")),
         "code_postal": siege.get("code_postal", "") or item.get("code_postal", ""),
         "ville": siege.get("ville", "") or item.get("ville", ""),
-        "effectif": item.get("effectif", ""),
+        "effectif": item.get("effectif", "") or item.get("tranche_effectif", ""),
+        "chiffre_affaires": fin.get("chiffre_affaires", "") if fin else "",
+        "annee_ca": fin.get("annee", "") if fin else "",
+        "resultat": fin.get("resultat", "") if fin else "",
+        "email": premier(item, siege, "email", "adresse_email"),
+        "telephone": premier(item, siege, "telephone", "numero_telephone"),
+        "site_web": premier(item, siege, "site_internet", "site_web"),
         "statut": item.get("statut_consolide", "") or item.get("statut_rcs", ""),
-        "dirigeants": dirigeants_de(item),
+        "dirigeants": formater(liste_representants(item)),
     }
+    ligne.update(dirigeant_principal(item))
+    return ligne
 
 
 # ---------------------------------------------------------------------------
-# Export Excel : nouvelles lignes en vert
+# Export Excel
 # ---------------------------------------------------------------------------
 
 def ecrire_xlsx(lignes, sirens_nouveaux):
-    """Reecrit tout le fichier .xlsx ; seules les lignes de ce run sont vertes."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Restaurants Metz"
@@ -259,19 +336,22 @@ def ecrire_xlsx(lignes, sirens_nouveaux):
             if nouveau:
                 c.fill = vert
 
-    # SIREN / SIRET en texte pour ne pas perdre de zeros ni passer en notation
-    # scientifique
-    for nom_col in ("siren", "siret_siege"):
+    for nom_col in ("siren", "siret_siege", "telephone"):
         idx = CHAMPS.index(nom_col) + 1
         for row in ws.iter_rows(min_row=2, min_col=idx, max_col=idx):
             row[0].number_format = "@"
             row[0].value = str(row[0].value or "")
 
     largeurs = {
-        "date_ajout": 12, "siren": 12, "siret_siege": 16, "nom": 32,
-        "forme_juridique": 30, "code_naf": 9, "libelle_naf": 26,
-        "date_creation": 13, "adresse": 36, "code_postal": 11, "ville": 20,
-        "effectif": 24, "statut": 9, "dirigeants": 50,
+        "date_ajout": 12, "siren": 12, "siret_siege": 16, "nom": 30,
+        "raison_sociale": 30, "forme_juridique": 30, "code_naf": 9,
+        "libelle_naf": 24, "date_creation": 13, "annee_ouverture": 10,
+        "adresse": 34, "code_postal": 11, "ville": 18, "effectif": 22,
+        "chiffre_affaires": 14, "annee_ca": 8, "resultat": 12,
+        "email": 30, "telephone": 16, "site_web": 26, "statut": 9,
+        "dirigeant_nom": 18, "dirigeant_prenom": 16, "dirigeant_poste": 40,
+        "dirigeant_adresse": 30, "dirigeant_code_postal": 11,
+        "dirigeant_ville": 16, "dirigeants": 50,
     }
     for i, nom_col in enumerate(CHAMPS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = largeurs.get(nom_col, 15)
@@ -279,6 +359,15 @@ def ecrire_xlsx(lignes, sirens_nouveaux):
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     wb.save(XLSX_PATH)
+
+
+def ecrire_csv(lignes):
+    """Reecrit tout le CSV (migre automatiquement l'ancien format de colonnes)."""
+    with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CHAMPS, restval="",
+                           extrasaction="ignore")
+        w.writeheader()
+        w.writerows(lignes)
 
 
 # ---------------------------------------------------------------------------
@@ -292,8 +381,7 @@ def main():
 
     retenues = []
     tours = 0
-    trace_faite = False
-    page_epuisee = True          # la page courante a-t-elle ete lue en entier ?
+    page_epuisee = True
 
     while len(retenues) < NB_PAR_EXECUTION and tours < 10:
         tours += 1
@@ -319,9 +407,6 @@ def main():
         page_epuisee = True
         for item in resultats:
             if len(retenues) >= NB_PAR_EXECUTION:
-                # il reste des resultats non traites sur cette page :
-                # on ne passera pas a la page suivante (ils seront repris
-                # au prochain run, les doublons etant ignores).
                 page_epuisee = False
                 break
 
@@ -340,21 +425,17 @@ def main():
                       f"({ligne['code_postal']} {ligne['ville']})")
                 continue
 
-            # Detail : 1 credit, seule source fiable des dirigeants
-            if ENRICHIR_ENTREPRISE and not ligne["dirigeants"]:
+            # Detail : 1 credit -> dirigeants, finances, contacts
+            if ENRICHIR_ENTREPRISE:
                 detail = get("entreprise", 1, siren=siren)
                 if detail:
                     if DEBUG and "entreprise" not in debug:
                         debug["entreprise"] = detail
-                    ligne["dirigeants"] = dirigeants_de(
-                        detail, tracer=not trace_faite
-                    )
-                    trace_faite = True
-                    # completer les champs vides avec le detail
+                    # le detail prime pour les champs vides
                     for cle, valeur in extraire(detail).items():
                         if cle == "date_ajout":
                             continue
-                        if not ligne.get(cle) and valeur:
+                        if valeur not in ("", None) and ligne.get(cle) in ("", None):
                             ligne[cle] = valeur
                 time.sleep(0.3)
 
@@ -369,17 +450,9 @@ def main():
         print(f"Cout estime : {cout} credits")
         return
 
-    # --- CSV : ajout des nouvelles lignes ---------------------------------
-    nouveau_fichier = not CSV_PATH.exists()
-    with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CHAMPS)
-        if nouveau_fichier:
-            w.writeheader()
-        w.writerows(retenues)
-
-    # --- XLSX : tout l'historique, seules les nouvelles lignes en vert ----
-    sirens_nouveaux = {e["siren"] for e in retenues}
-    ecrire_xlsx(existantes + retenues, sirens_nouveaux)
+    toutes = existantes + retenues
+    ecrire_csv(toutes)
+    ecrire_xlsx(toutes, {e["siren"] for e in retenues})
 
     state["page"] = page
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -394,8 +467,12 @@ def main():
     for e in retenues:
         print(f"  {e['nom']} ({e['siren']})")
         print(f"    {e['adresse']}, {e['code_postal']} {e['ville']}")
-        print(f"    dirigeants : {e['dirigeants'] or 'non renseignes'}")
-    sans = sum(1 for e in retenues if not e["dirigeants"])
+        print(f"    dirigeant : {e['dirigeant_prenom']} {e['dirigeant_nom']} "
+              f"- {e['dirigeant_poste'] or 'poste non renseigne'}")
+        print(f"    contact   : {e['email'] or '-'} / {e['telephone'] or '-'}")
+        ca = e["chiffre_affaires"]
+        print(f"    CA        : {ca if ca != '' else '-'} ({e['annee_ca'] or '-'})")
+    sans = sum(1 for e in retenues if not e["dirigeant_nom"])
     if sans:
         print(f"\n[warn] {sans} ligne(s) sans dirigeant.")
     print(f"\nFichiers : {CSV_PATH} et {XLSX_PATH} (nouvelles lignes en vert)")
