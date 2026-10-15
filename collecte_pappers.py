@@ -6,13 +6,15 @@ COMPORTEMENT
 ------------
 - Ajoute NB_PAR_EXECUTION NOUVEAUX restaurants a chaque execution.
 - Deduplication par SIREN sur data/restaurants_metz.csv.
+- Parcourt TOUS les codes NAF de restauration (pas seulement 56.10A).
 - Recupere pour chaque societe :
-    * le DIRIGEANT PRINCIPAL : nom, prenom, poste (qualite), adresse
-    * la liste complete des dirigeants
+    * jusqu'a 5 DIRIGEANTS, chacun avec ses propres colonnes :
+      nom, prenom, poste (qualite), adresse, code postal, ville
     * e-mail, telephone, site web (si Pappers les fournit)
     * annee d'ouverture, effectif, chiffre d'affaires + annee, resultat
   -> colonnes pensees pour l'import dans Odoo CRM (lead + contact).
 - Genere data/restaurants_metz.xlsx : lignes du run en VERT.
+  L'en-tete Excel est colore par categorie d'information.
 
 COUT
 ----
@@ -30,7 +32,7 @@ from pathlib import Path
 
 import requests
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ===========================================================================
@@ -39,15 +41,24 @@ from openpyxl.utils import get_column_letter
 
 CLE_API = "COLLE_TA_CLE_PAPPERS_ICI"   # ou secret GitHub PAPPERS_API_KEY
 
-CODE_NAF = "56.10A"
+# TOUS les codes NAF de restauration (pas seulement 56.10A)
+CODES_NAF = [
+    "56.10A",  # Restauration traditionnelle
+    "56.10B",  # Cafeteria
+    "56.10C",  # Restauration de type rapide
+    "56.21Z",  # Preparation de repas sur place (traiteurs)
+    "56.29Z",  # Autres restauration (food trucks, etc.)
+    "56.30Z",  # Debits de boissons (bars)
+]
+
 CODE_POSTAL = "57000"
 NB_PAR_EXECUTION = 5
+MAX_DIRIGEANTS = 5
 
 EXCLURE_RADIEES = True
 SIEGE_DANS_LA_ZONE = True
 ENRICHIR_ENTREPRISE = True
-DEBUG = False                # True : ecrit debug_pappers.json (a utiliser si
-                             # une colonne reste vide, pour voir les vrais champs)
+DEBUG = False                # True : ecrit debug_pappers.json
 
 COULEUR_NOUVEAU = "C6EFCE"
 
@@ -69,16 +80,86 @@ XLSX_PATH = DATA / "restaurants_metz.xlsx"
 STATE_PATH = DATA / "state.json"
 DEBUG_PATH = DATA / "debug_pappers.json"
 
-CHAMPS = [
-    "date_ajout", "siren", "siret_siege", "nom", "raison_sociale",
-    "forme_juridique", "code_naf", "libelle_naf", "date_creation",
-    "annee_ouverture", "adresse", "code_postal", "ville", "effectif",
-    "chiffre_affaires", "annee_ca", "resultat",
-    "email", "telephone", "site_web", "statut",
-    "dirigeant_nom", "dirigeant_prenom", "dirigeant_poste",
-    "dirigeant_adresse", "dirigeant_code_postal", "dirigeant_ville",
-    "dirigeants",
+# ===========================================================================
+# DEFINITION DES COLONNES ET CATEGORIES COLOREES
+# ===========================================================================
+
+# Construit dynamiquement les colonnes dirigeant
+def _construire_champs():
+    champs = [
+        # --- Entreprise ---
+        "date_ajout", "siren", "siret_siege", "nom", "raison_sociale",
+        "forme_juridique",
+        # --- Activite ---
+        "code_naf", "libelle_naf", "date_creation", "annee_ouverture",
+        # --- Localisation ---
+        "adresse", "code_postal", "ville",
+        # --- Finances ---
+        "effectif", "chiffre_affaires", "annee_ca", "resultat",
+        # --- Contact ---
+        "email", "telephone", "site_web", "statut",
+    ]
+    # --- Dirigeants (un groupe de colonnes par dirigeant) ---
+    for i in range(1, MAX_DIRIGEANTS + 1):
+        champs += [
+            f"dirigeant_{i}_nom",
+            f"dirigeant_{i}_prenom",
+            f"dirigeant_{i}_poste",
+            f"dirigeant_{i}_adresse",
+            f"dirigeant_{i}_code_postal",
+            f"dirigeant_{i}_ville",
+        ]
+    champs.append("nombre_dirigeants")
+    return champs
+
+
+CHAMPS = _construire_champs()
+
+# Categories pour les couleurs d'en-tete Excel
+# Chaque categorie : nom affiche, couleur de fond, liste des colonnes
+CATEGORIES = [
+    {
+        "libelle": "ENTREPRISE",
+        "couleur": "1F3864",       # bleu fonce
+        "colonnes": ["date_ajout", "siren", "siret_siege", "nom",
+                      "raison_sociale", "forme_juridique"],
+    },
+    {
+        "libelle": "ACTIVITE",
+        "couleur": "2E7D32",       # vert fonce
+        "colonnes": ["code_naf", "libelle_naf", "date_creation",
+                      "annee_ouverture"],
+    },
+    {
+        "libelle": "LOCALISATION",
+        "couleur": "8B4513",       # marron
+        "colonnes": ["adresse", "code_postal", "ville"],
+    },
+    {
+        "libelle": "FINANCES",
+        "couleur": "B45309",       # orange fonce
+        "colonnes": ["effectif", "chiffre_affaires", "annee_ca", "resultat"],
+    },
+    {
+        "libelle": "CONTACT",
+        "couleur": "0F6B6B",       # turquoise fonce
+        "colonnes": ["email", "telephone", "site_web", "statut"],
+    },
+    {
+        "libelle": "DIRIGEANTS",
+        "couleur": "7C2D12",       # rouge-marron fonce
+        "colonnes": [c for c in CHAMPS
+                     if c.startswith("dirigeant_") or c == "nombre_dirigeants"],
+    },
 ]
+
+# Mapping colonne -> couleur (pour colorer chaque cellule d'en-tete)
+_COULEUR_COLONNE = {}
+for cat in CATEGORIES:
+    for col in cat["colonnes"]:
+        _COULEUR_COLONNE[col] = cat["couleur"]
+
+# ===========================================================================
 
 cout = 0
 debug = {}
@@ -112,8 +193,8 @@ def charger_state():
         try:
             return json.loads(STATE_PATH.read_text())
         except json.JSONDecodeError:
-            print("[warn] state.json illisible, on repart de la page 1.")
-    return {"page": 1}
+            print("[warn] state.json illisible, on repart du debut.")
+    return {"naf_index": 0, "page": 1}
 
 
 def lire_csv():
@@ -136,7 +217,6 @@ INDICES_PERSONNE = {
     "prenom_usuel", "nom_usage", "fonction",
 }
 
-# Ordre de preference pour choisir le "dirigeant principal"
 PRIORITE_POSTES = [
     "gerant", "gérant", "president", "président", "directeur general",
     "directeur général", "dirigeant", "associe unique", "associé unique",
@@ -173,18 +253,6 @@ def liste_representants(item):
     return []
 
 
-def formater(liste):
-    out = []
-    for d in liste:
-        nom = nom_personne(d)
-        if not nom:
-            continue
-        entree = " | ".join(x for x in [nom, poste_de(d)] if x)
-        if entree not in out:
-            out.append(entree)
-    return " ; ".join(out)
-
-
 def score_dirigeant(d):
     """Plus petit = meilleur. Prefere une personne physique avec un poste cle."""
     morale = 1 if d.get("personne_morale") else 0
@@ -197,27 +265,48 @@ def score_dirigeant(d):
     return (morale, rang)
 
 
-def dirigeant_principal(item):
+def extraire_dirigeants(item):
+    """
+    Retourne un dict avec les colonnes dirigeant_1_* ... dirigeant_5_*
+    et nombre_dirigeants.
+    Chaque dirigeant a ses propres colonnes : nom, prenom, poste, adresse,
+    code postal, ville.
+    """
     reps = liste_representants(item)
-    vide = {k: "" for k in (
-        "dirigeant_nom", "dirigeant_prenom", "dirigeant_poste",
-        "dirigeant_adresse", "dirigeant_code_postal", "dirigeant_ville")}
+    resultat = {}
+
+    # Colonnes vides par defaut
+    for i in range(1, MAX_DIRIGEANTS + 1):
+        resultat[f"dirigeant_{i}_nom"] = ""
+        resultat[f"dirigeant_{i}_prenom"] = ""
+        resultat[f"dirigeant_{i}_poste"] = ""
+        resultat[f"dirigeant_{i}_adresse"] = ""
+        resultat[f"dirigeant_{i}_code_postal"] = ""
+        resultat[f"dirigeant_{i}_ville"] = ""
+
+    resultat["nombre_dirigeants"] = 0
+
     if not reps:
-        return vide
-    d = sorted(reps, key=score_dirigeant)[0]
-    nom = d.get("nom") or ""
-    prenom = d.get("prenom") or d.get("prenom_usuel") or ""
-    if not nom and not prenom:
-        # personne morale ou champ nom_complet seul
-        nom = nom_personne(d)
-    return {
-        "dirigeant_nom": str(nom).strip(),
-        "dirigeant_prenom": str(prenom).strip(),
-        "dirigeant_poste": poste_de(d),
-        "dirigeant_adresse": d.get("adresse_ligne_1") or "",
-        "dirigeant_code_postal": d.get("code_postal") or "",
-        "dirigeant_ville": d.get("ville") or "",
-    }
+        return resultat
+
+    # Trier par score (meilleur en premier)
+    reps_tries = sorted(reps, key=score_dirigeant)
+    resultat["nombre_dirigeants"] = len(reps_tries)
+
+    for i, d in enumerate(reps_tries[:MAX_DIRIGEANTS], start=1):
+        nom = d.get("nom") or ""
+        prenom = d.get("prenom") or d.get("prenom_usuel") or ""
+        if not nom and not prenom:
+            nom = nom_personne(d)
+        prefix = f"dirigeant_{i}_"
+        resultat[prefix + "nom"] = str(nom).strip()
+        resultat[prefix + "prenom"] = str(prenom).strip()
+        resultat[prefix + "poste"] = poste_de(d)
+        resultat[prefix + "adresse"] = d.get("adresse_ligne_1") or ""
+        resultat[prefix + "code_postal"] = d.get("code_postal") or ""
+        resultat[prefix + "ville"] = d.get("ville") or ""
+
+    return resultat
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +327,7 @@ def derniere_finance(item):
 
 
 def premier(item, siege, *cles):
-    """Premiere valeur non vide parmi plusieurs cles, au niveau societe puis siege."""
+    """Premiere valeur non vide parmi plusieurs cles."""
     for src in (item, siege):
         for c in cles:
             v = src.get(c)
@@ -250,7 +339,6 @@ def premier(item, siege, *cles):
 def annee_ouverture(item):
     d = item.get("date_creation") or item.get("date_creation_formate") or ""
     d = str(d)
-    # formats : 2024-03-01 ou 01/03/2024
     if len(d) >= 4 and d[:4].isdigit():
         return d[:4]
     if len(d) >= 4 and d[-4:].isdigit():
@@ -300,14 +388,14 @@ def extraire(item):
         "telephone": premier(item, siege, "telephone", "numero_telephone"),
         "site_web": premier(item, siege, "site_internet", "site_web"),
         "statut": item.get("statut_consolide", "") or item.get("statut_rcs", ""),
-        "dirigeants": formater(liste_representants(item)),
     }
-    ligne.update(dirigeant_principal(item))
+    # Dirigeants : un groupe de colonnes par dirigeant
+    ligne.update(extraire_dirigeants(item))
     return ligne
 
 
 # ---------------------------------------------------------------------------
-# Export Excel
+# Export Excel avec en-tete colore par categorie
 # ---------------------------------------------------------------------------
 
 def ecrire_xlsx(lignes, sirens_nouveaux):
@@ -317,52 +405,111 @@ def ecrire_xlsx(lignes, sirens_nouveaux):
 
     police = Font(name="Arial", size=10)
     police_titre = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-    fond_titre = PatternFill("solid", start_color="1F3864", end_color="1F3864")
+    police_categorie = Font(name="Arial", size=11, bold=True, color="FFFFFF")
     vert = PatternFill("solid", start_color=COULEUR_NOUVEAU,
                        end_color=COULEUR_NOUVEAU)
+    bordure = Border(
+        left=Side(style="thin", color="000000"),
+        right=Side(style="thin", color="000000"),
+        top=Side(style="thin", color="000000"),
+        bottom=Side(style="thin", color="000000"),
+    )
 
-    ws.append(CHAMPS)
-    for c in ws[1]:
-        c.font = police_titre
-        c.fill = fond_titre
-        c.alignment = Alignment(horizontal="center", vertical="center")
+    # --- Ligne 1 : categories (fusionnees) ---
+    for cat in CATEGORIES:
+        premiere_col = None
+        derniere_col = None
+        for idx, nom_col in enumerate(CHAMPS, start=1):
+            if nom_col in cat["colonnes"]:
+                if premiere_col is None:
+                    premiere_col = idx
+                derniere_col = idx
+        if premiere_col is None:
+            continue
+        fond = PatternFill("solid", start_color=cat["couleur"],
+                           end_color=cat["couleur"])
+        ws.cell(row=1, column=premiere_col, value=cat["libelle"])
+        ws.cell(row=1, column=premiere_col).font = police_categorie
+        ws.cell(row=1, column=premiere_col).fill = fond
+        ws.cell(row=1, column=premiere_col).alignment = Alignment(
+            horizontal="center", vertical="center")
+        ws.cell(row=1, column=premiere_col).border = bordure
+        if derniere_col > premiere_col:
+            ws.merge_cells(
+                start_row=1, start_column=premiere_col,
+                end_row=1, end_column=derniere_col)
+            # Bordure sur toutes les cellules fusionnees
+            for c in range(premiere_col, derniere_col + 1):
+                ws.cell(row=1, column=c).fill = fond
+                ws.cell(row=1, column=c).border = bordure
 
+    # --- Ligne 2 : noms de colonnes (colores par categorie) ---
+    for idx, nom_col in enumerate(CHAMPS, start=1):
+        cellule = ws.cell(row=2, column=idx, value=nom_col)
+        cellule.font = police_titre
+        couleur = _COULEUR_COLONNE.get(nom_col, "333333")
+        cellule.fill = PatternFill("solid", start_color=couleur,
+                                   end_color=couleur)
+        cellule.alignment = Alignment(horizontal="center", vertical="center",
+                                       wrap_text=True)
+        cellule.border = bordure
+
+    # --- Donnees (a partir de la ligne 3) ---
     for ligne in lignes:
         ws.append([ligne.get(c, "") for c in CHAMPS])
         nouveau = ligne.get("siren") in sirens_nouveaux
         for c in ws[ws.max_row]:
             c.font = police
-            c.alignment = Alignment(vertical="top")
+            c.alignment = Alignment(vertical="top", wrap_text=True)
             if nouveau:
                 c.fill = vert
 
-    for nom_col in ("siren", "siret_siege", "telephone"):
+    # Format texte pour les colonnes numeriques (SIREN, SIRET, telephone)
+    for nom_col in ("siren", "siret_siege", "telephone",
+                    "dirigeant_1_code_postal", "dirigeant_2_code_postal",
+                    "dirigeant_3_code_postal", "dirigeant_4_code_postal",
+                    "dirigeant_5_code_postal"):
+        if nom_col not in CHAMPS:
+            continue
         idx = CHAMPS.index(nom_col) + 1
-        for row in ws.iter_rows(min_row=2, min_col=idx, max_col=idx):
+        for row in ws.iter_rows(min_row=3, min_col=idx, max_col=idx):
             row[0].number_format = "@"
             row[0].value = str(row[0].value or "")
 
+    # Largeurs de colonnes
     largeurs = {
         "date_ajout": 12, "siren": 12, "siret_siege": 16, "nom": 30,
-        "raison_sociale": 30, "forme_juridique": 30, "code_naf": 9,
-        "libelle_naf": 24, "date_creation": 13, "annee_ouverture": 10,
+        "raison_sociale": 30, "forme_juridique": 28, "code_naf": 9,
+        "libelle_naf": 28, "date_creation": 13, "annee_ouverture": 10,
         "adresse": 34, "code_postal": 11, "ville": 18, "effectif": 22,
         "chiffre_affaires": 14, "annee_ca": 8, "resultat": 12,
         "email": 30, "telephone": 16, "site_web": 26, "statut": 9,
-        "dirigeant_nom": 18, "dirigeant_prenom": 16, "dirigeant_poste": 40,
-        "dirigeant_adresse": 30, "dirigeant_code_postal": 11,
-        "dirigeant_ville": 16, "dirigeants": 50,
+        "nombre_dirigeants": 10,
     }
-    for i, nom_col in enumerate(CHAMPS, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = largeurs.get(nom_col, 15)
+    # Largeurs pour les colonnes dirigeant
+    for i in range(1, MAX_DIRIGEANTS + 1):
+        largeurs[f"dirigeant_{i}_nom"] = 18
+        largeurs[f"dirigeant_{i}_prenom"] = 16
+        largeurs[f"dirigeant_{i}_poste"] = 30
+        largeurs[f"dirigeant_{i}_adresse"] = 30
+        largeurs[f"dirigeant_{i}_code_postal"] = 11
+        largeurs[f"dirigeant_{i}_ville"] = 16
 
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+    for i, nom_col in enumerate(CHAMPS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = largeurs.get(
+            nom_col, 15)
+
+    # Hauteur des lignes d'en-tete
+    ws.row_dimensions[1].height = 22
+    ws.row_dimensions[2].height = 30
+
+    ws.freeze_panes = "A3"
+    ws.auto_filter.ref = f"A2:{get_column_letter(len(CHAMPS))}{ws.max_row}"
     wb.save(XLSX_PATH)
 
 
 def ecrire_csv(lignes):
-    """Reecrit tout le CSV (migre automatiquement l'ancien format de colonnes)."""
+    """Reecrit tout le CSV."""
     with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CHAMPS, restval="",
                            extrasaction="ignore")
@@ -377,76 +524,91 @@ def main():
     state = charger_state()
     existantes = lire_csv()
     vus = {l["siren"] for l in existantes if l.get("siren")}
+    naf_index = state.get("naf_index", 0)
     page = state.get("page", 1)
 
     retenues = []
     tours = 0
-    page_epuisee = True
 
-    while len(retenues) < NB_PAR_EXECUTION and tours < 10:
-        tours += 1
-        res = get(
-            "recherche", 2,
-            code_naf=CODE_NAF,
-            code_postal=CODE_POSTAL,
-            entreprise_cessee="false",
-            par_page=20,
-            page=page,
-        )
+    # Parcourir les codes NAF a partir de la position sauvegardee
+    while naf_index < len(CODES_NAF) and len(retenues) < NB_PAR_EXECUTION:
+        code_naf_courant = CODES_NAF[naf_index]
+        print(f"\n=== NAF {code_naf_courant} (page {page}) ===")
 
-        if not res:
-            break
-        resultats = res.get("resultats", [])
-        if not resultats:
-            print(f"Plus de resultats (page {page}), arret.")
-            break
+        while len(retenues) < NB_PAR_EXECUTION and tours < 30:
+            tours += 1
+            res = get(
+                "recherche", 2,
+                code_naf=code_naf_courant,
+                code_postal=CODE_POSTAL,
+                entreprise_cessee="false",
+                par_page=20,
+                page=page,
+            )
 
-        if DEBUG and "recherche" not in debug:
-            debug["recherche"] = resultats[0]
-
-        page_epuisee = True
-        for item in resultats:
-            if len(retenues) >= NB_PAR_EXECUTION:
-                page_epuisee = False
+            if not res:
+                break
+            resultats = res.get("resultats", [])
+            if not resultats:
+                print(f"  Plus de resultats pour {code_naf_courant} "
+                      f"(page {page}), passage au NAF suivant.")
                 break
 
-            siren = item.get("siren")
-            if not siren or siren in vus:
-                continue
+            if DEBUG and "recherche" not in debug:
+                debug["recherche"] = resultats[0]
 
-            if EXCLURE_RADIEES and not est_active(item):
-                print(f"[skip] {item.get('nom_entreprise', siren)} : radiee")
-                continue
+            page_epuisee = True
+            for item in resultats:
+                if len(retenues) >= NB_PAR_EXECUTION:
+                    page_epuisee = False
+                    break
 
-            ligne = extraire(item)
+                siren = item.get("siren")
+                if not siren or siren in vus:
+                    continue
 
-            if SIEGE_DANS_LA_ZONE and ligne["code_postal"] != CODE_POSTAL:
-                print(f"[skip] {ligne['nom'] or siren} : siege hors {CODE_POSTAL} "
-                      f"({ligne['code_postal']} {ligne['ville']})")
-                continue
+                if EXCLURE_RADIEES and not est_active(item):
+                    print(f"  [skip] {item.get('nom_entreprise', siren)} : radiee")
+                    continue
 
-            # Detail : 1 credit -> dirigeants, finances, contacts
-            if ENRICHIR_ENTREPRISE:
-                detail = get("entreprise", 1, siren=siren)
-                if detail:
-                    if DEBUG and "entreprise" not in debug:
-                        debug["entreprise"] = detail
-                    # le detail prime pour les champs vides
-                    for cle, valeur in extraire(detail).items():
-                        if cle == "date_ajout":
-                            continue
-                        if valeur not in ("", None) and ligne.get(cle) in ("", None):
-                            ligne[cle] = valeur
-                time.sleep(0.3)
+                ligne = extraire(item)
 
-            retenues.append(ligne)
-            vus.add(siren)
+                if SIEGE_DANS_LA_ZONE and ligne["code_postal"] != CODE_POSTAL:
+                    print(f"  [skip] {ligne['nom'] or siren} : siege hors "
+                          f"{CODE_POSTAL} ({ligne['code_postal']} "
+                          f"{ligne['ville']})")
+                    continue
 
-        if page_epuisee:
-            page += 1
+                # Detail : 1 credit -> dirigeants, finances, contacts
+                if ENRICHIR_ENTREPRISE:
+                    detail = get("entreprise", 1, siren=siren)
+                    if detail:
+                        if DEBUG and "entreprise" not in debug:
+                            debug["entreprise"] = detail
+                        # Le detail prime pour les champs vides
+                        detail_extrait = extraire(detail)
+                        for cle, valeur in detail_extrait.items():
+                            if cle == "date_ajout":
+                                continue
+                            if (valeur not in ("", None)
+                                    and ligne.get(cle) in ("", None)):
+                                ligne[cle] = valeur
+                    time.sleep(0.3)
+
+                retenues.append(ligne)
+                vus.add(siren)
+
+            if page_epuisee:
+                page += 1
+
+        # Si ce NAF est epuise, passer au suivant
+        if len(retenues) < NB_PAR_EXECUTION:
+            naf_index += 1
+            page = 1
+            print(f"  -> Passage au NAF suivant.")
 
     if not retenues:
-        print("Aucune nouvelle entreprise retenue - rien n'est ecrit.")
+        print("\nAucune nouvelle entreprise retenue - rien n'est ecrit.")
         print(f"Cout estime : {cout} credits")
         return
 
@@ -454,6 +616,7 @@ def main():
     ecrire_csv(toutes)
     ecrire_xlsx(toutes, {e["siren"] for e in retenues})
 
+    state["naf_index"] = naf_index
     state["page"] = page
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -465,19 +628,34 @@ def main():
     print(f"\n{len(retenues)} entreprise(s) ajoutee(s) le "
           f"{date.today().isoformat()} :\n")
     for e in retenues:
-        print(f"  {e['nom']} ({e['siren']})")
+        print(f"  {e['nom']} ({e['siren']}) [{e['code_naf']}]")
         print(f"    {e['adresse']}, {e['code_postal']} {e['ville']}")
-        print(f"    dirigeant : {e['dirigeant_prenom']} {e['dirigeant_nom']} "
-              f"- {e['dirigeant_poste'] or 'poste non renseigne'}")
-        print(f"    contact   : {e['email'] or '-'} / {e['telephone'] or '-'}")
+        nb_dir = e.get("nombre_dirigeants", 0)
+        if nb_dir > 0:
+            for i in range(1, min(nb_dir, MAX_DIRIGEANTS) + 1):
+                prenom = e.get(f"dirigeant_{i}_prenom", "")
+                nom = e.get(f"dirigeant_{i}_nom", "")
+                poste = e.get(f"dirigeant_{i}_poste", "")
+                print(f"    dirigeant {i} : {prenom} {nom} - "
+                      f"{poste or 'poste non renseigne'}")
+        else:
+            print(f"    dirigeant : aucun renseigne")
+        print(f"    contact   : {e['email'] or '-'} / "
+              f"{e['telephone'] or '-'}")
         ca = e["chiffre_affaires"]
-        print(f"    CA        : {ca if ca != '' else '-'} ({e['annee_ca'] or '-'})")
-    sans = sum(1 for e in retenues if not e["dirigeant_nom"])
+        print(f"    CA        : {ca if ca != '' else '-'} "
+              f"({e['annee_ca'] or '-'})")
+    sans = sum(1 for e in retenues if not e.get("dirigeant_1_nom"))
     if sans:
         print(f"\n[warn] {sans} ligne(s) sans dirigeant.")
-    print(f"\nFichiers : {CSV_PATH} et {XLSX_PATH} (nouvelles lignes en vert)")
+    print(f"\nFichiers : {CSV_PATH} et {XLSX_PATH}")
+    print(f"  (nouvelles lignes en vert, en-tete colore par categorie)")
     print(f"Cout estime : {cout} credits")
-    print(f"Prochaine execution : page {page}")
+    if naf_index < len(CODES_NAF):
+        print(f"Prochaine execution : NAF {CODES_NAF[naf_index]} "
+              f"(page {page})")
+    else:
+        print("Tous les codes NAF ont ete parcourus.")
 
 
 if __name__ == "__main__":
