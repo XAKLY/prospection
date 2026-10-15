@@ -7,6 +7,8 @@ COMPORTEMENT
 - Ajoute NB_PAR_EXECUTION NOUVEAUX restaurants a chaque execution.
 - Deduplication par SIREN sur data/restaurants_metz.csv.
 - Parcourt TOUS les codes NAF de restauration (pas seulement 56.10A).
+- MELANGE les codes NAF : chaque lot de 20 contient un mix de types
+  de restauration differents (round-robin entre les codes NAF).
 - Recupere pour chaque societe :
     * le DIRIGEANT PRINCIPAL : nom, prenom, poste (qualite), adresse,
       code postal, ville (chacun dans sa propre colonne)
@@ -181,7 +183,7 @@ def charger_state():
             return json.loads(STATE_PATH.read_text())
         except json.JSONDecodeError:
             print("[warn] state.json illisible, on repart du debut.")
-    return {"naf_index": 0, "page": 1}
+    return {}
 
 
 def lire_csv():
@@ -509,88 +511,109 @@ def main():
     state = charger_state()
     existantes = lire_csv()
     vus = {l["siren"] for l in existantes if l.get("siren")}
+
+    # --- Etat : une page par code NAF (round-robin) ---
+    # state = {"pages": {"56.10A": 1, "56.10B": 1, ...}, "naf_index": 0}
+    pages_par_naf = state.get("pages", {})
+    for code in CODES_NAF:
+        pages_par_naf.setdefault(code, 1)
     naf_index = state.get("naf_index", 0)
-    page = state.get("page", 1)
 
     retenues = []
+    # NAF codes encore exploitables (non epuises)
+    naf_actifs = list(range(len(CODES_NAF)))
     tours = 0
+    MAX_TOURS = 60  # securite : eviter une boucle infinie
 
-    # Parcourir les codes NAF a partir de la position sauvegardee
-    while naf_index < len(CODES_NAF) and len(retenues) < NB_PAR_EXECUTION:
-        code_naf_courant = CODES_NAF[naf_index]
+    print(f"Objectif : {NB_PAR_EXECUTION} nouveaux restaurants, melanges par NAF.")
+
+    # Round-robin : on prend quelques restaurants de chaque NAF a tour de role
+    while len(retenues) < NB_PAR_EXECUTION and naf_actifs and tours < MAX_TOURS:
+        tours += 1
+        naf_index = naf_index % len(naf_actifs)
+        idx_naf = naf_actifs[naf_index]
+        code_naf_courant = CODES_NAF[idx_naf]
+        page = pages_par_naf[code_naf_courant]
+
         print(f"\n=== NAF {code_naf_courant} (page {page}) ===")
 
-        while len(retenues) < NB_PAR_EXECUTION and tours < 30:
-            tours += 1
-            res = get(
-                "recherche", 2,
-                code_naf=code_naf_courant,
-                code_postal=CODE_POSTAL,
-                entreprise_cessee="false",
-                par_page=20,
-                page=page,
-            )
+        res = get(
+            "recherche", 2,
+            code_naf=code_naf_courant,
+            code_postal=CODE_POSTAL,
+            entreprise_cessee="false",
+            par_page=20,
+            page=page,
+        )
 
-            if not res:
+        if not res:
+            print(f"  Recherche impossible pour {code_naf_courant}, NAF retire.")
+            naf_actifs.pop(naf_index)
+            continue
+
+        resultats = res.get("resultats", [])
+        if not resultats:
+            print(f"  Plus de resultats pour {code_naf_courant}, NAF epuise.")
+            naf_actifs.pop(naf_index)
+            continue
+
+        if DEBUG and "recherche" not in debug:
+            debug["recherche"] = resultats[0]
+
+        # Compter combien de nouveaux on peut prendre de cette page
+        ajoutes_ce_tour = 0
+        page_epuisee = True
+
+        for item in resultats:
+            if len(retenues) >= NB_PAR_EXECUTION:
+                page_epuisee = False
                 break
-            resultats = res.get("resultats", [])
-            if not resultats:
-                print(f"  Plus de resultats pour {code_naf_courant} "
-                      f"(page {page}), passage au NAF suivant.")
-                break
 
-            if DEBUG and "recherche" not in debug:
-                debug["recherche"] = resultats[0]
+            siren = item.get("siren")
+            if not siren or siren in vus:
+                continue
 
-            page_epuisee = True
-            for item in resultats:
-                if len(retenues) >= NB_PAR_EXECUTION:
-                    page_epuisee = False
-                    break
+            if EXCLURE_RADIEES and not est_active(item):
+                print(f"  [skip] {item.get('nom_entreprise', siren)} : radiee")
+                continue
 
-                siren = item.get("siren")
-                if not siren or siren in vus:
-                    continue
+            ligne = extraire(item)
 
-                if EXCLURE_RADIEES and not est_active(item):
-                    print(f"  [skip] {item.get('nom_entreprise', siren)} : radiee")
-                    continue
+            if SIEGE_DANS_LA_ZONE and ligne["code_postal"] != CODE_POSTAL:
+                print(f"  [skip] {ligne['nom'] or siren} : siege hors "
+                      f"{CODE_POSTAL} ({ligne['code_postal']} "
+                      f"{ligne['ville']})")
+                continue
 
-                ligne = extraire(item)
+            # Detail : 1 credit -> dirigeants, finances, contacts
+            if ENRICHIR_ENTREPRISE:
+                detail = get("entreprise", 1, siren=siren)
+                if detail:
+                    if DEBUG and "entreprise" not in debug:
+                        debug["entreprise"] = detail
+                    # Le detail prime pour les champs vides
+                    detail_extrait = extraire(detail)
+                    for cle, valeur in detail_extrait.items():
+                        if cle == "date_ajout":
+                            continue
+                        if (valeur not in ("", None)
+                                and ligne.get(cle) in ("", None)):
+                            ligne[cle] = valeur
+                time.sleep(0.3)
 
-                if SIEGE_DANS_LA_ZONE and ligne["code_postal"] != CODE_POSTAL:
-                    print(f"  [skip] {ligne['nom'] or siren} : siege hors "
-                          f"{CODE_POSTAL} ({ligne['code_postal']} "
-                          f"{ligne['ville']})")
-                    continue
+            retenues.append(ligne)
+            vus.add(siren)
+            ajoutes_ce_tour += 1
+            print(f"  [+] {ligne['nom'] or siren} [{code_naf_courant}]")
 
-                # Detail : 1 credit -> dirigeants, finances, contacts
-                if ENRICHIR_ENTREPRISE:
-                    detail = get("entreprise", 1, siren=siren)
-                    if detail:
-                        if DEBUG and "entreprise" not in debug:
-                            debug["entreprise"] = detail
-                        # Le detail prime pour les champs vides
-                        detail_extrait = extraire(detail)
-                        for cle, valeur in detail_extrait.items():
-                            if cle == "date_ajout":
-                                continue
-                            if (valeur not in ("", None)
-                                    and ligne.get(cle) in ("", None)):
-                                ligne[cle] = valeur
-                    time.sleep(0.3)
+        if page_epuisee:
+            pages_par_naf[code_naf_courant] = page + 1
 
-                retenues.append(ligne)
-                vus.add(siren)
+        print(f"  -> {ajoutes_ce_tour} nouveau(s) ce tour "
+              f"({len(retenues)}/{NB_PAR_EXECUTION} au total)")
 
-            if page_epuisee:
-                page += 1
-
-        # Si ce NAF est epuise, passer au suivant
-        if len(retenues) < NB_PAR_EXECUTION:
-            naf_index += 1
-            page = 1
-            print(f"  -> Passage au NAF suivant.")
+        # Passer au NAF suivant (round-robin)
+        naf_index += 1
 
     if not retenues:
         print("\nAucune nouvelle entreprise retenue - rien n'est ecrit.")
@@ -601,14 +624,20 @@ def main():
     ecrire_csv(toutes)
     ecrire_xlsx(toutes, {e["siren"] for e in retenues})
 
-    state["naf_index"] = naf_index
-    state["page"] = page
+    state["pages"] = pages_par_naf
+    state["naf_index"] = naf_index % len(CODES_NAF) if naf_actifs else 0
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     if DEBUG and debug:
         DEBUG_PATH.write_text(
             json.dumps(debug, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+
+    # Resume par NAF
+    par_naf = {}
+    for e in retenues:
+        code = e.get("code_naf", "?")
+        par_naf[code] = par_naf.get(code, 0) + 1
 
     print(f"\n{len(retenues)} entreprise(s) ajoutee(s) le "
           f"{date.today().isoformat()} :\n")
@@ -628,15 +657,21 @@ def main():
         ca = e["chiffre_affaires"]
         print(f"    CA        : {ca if ca != '' else '-'} "
               f"({e['annee_ca'] or '-'})")
+
+    print(f"\nRepartition par code NAF :")
+    for code in CODES_NAF:
+        if code in par_naf:
+            print(f"  {code} : {par_naf[code]}")
+
     sans = sum(1 for e in retenues if not e.get("dirigeant_nom"))
     if sans:
         print(f"\n[warn] {sans} ligne(s) sans dirigeant.")
     print(f"\nFichiers : {CSV_PATH} et {XLSX_PATH}")
     print(f"  (nouvelles lignes en vert, en-tete colore par categorie)")
     print(f"Cout estime : {cout} credits")
-    if naf_index < len(CODES_NAF):
-        print(f"Prochaine execution : NAF {CODES_NAF[naf_index]} "
-              f"(page {page})")
+    naf_restants = [CODES_NAF[i] for i in naf_actifs]
+    if naf_restants:
+        print(f"Prochaine execution : round-robin sur {naf_restants}")
     else:
         print("Tous les codes NAF ont ete parcourus.")
 
